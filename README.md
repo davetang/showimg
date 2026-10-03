@@ -81,7 +81,8 @@ image from standard input.
   -c COLS      at most COLS columns wide (default: the terminal's width)
   -r ROWS      at most ROWS rows tall (default: the terminal's height less 2)
   -p PROTOCOL  kitty, iterm, sixel or text (default: $SHOWIMG_PROTOCOL, or
-               the one your terminal supports)
+               the one your terminal supports; kitty if it can't be asked,
+               as inside GNU screen)
   -v           print the protocol and size used
   -h           show this help
 ```
@@ -148,17 +149,23 @@ extension works, and so does a PNG on standard input.
 
 Case doesn't matter. If no name matches, `showimg` uses `kitty` if the
 terminal answered its kitty graphics query, or `sixel` if the terminal reports
-sixel support. Otherwise it stops, says why it can't tell (for example, `it
-can't be asked from inside GNU screen`), and asks you to set
-`SHOWIMG_PROTOCOL`.
+sixel support.
+
+If the terminal can't be asked at all, `showimg` tries `kitty`, the protocol of
+kitty, Ghostty and Warp, and `-v` says why. That's the case inside GNU screen,
+which answers such questions itself, and inside tmux older than 3.3, which
+doesn't ask the terminal its name (Warp, for one, sets `TERM` to plain
+`xterm-256color`).
+
+Otherwise it stops, says why it can't tell (for example, `it didn't answer
+showimg's questions`), and asks you to set `SHOWIMG_PROTOCOL`.
 
 Set `SHOWIMG_PROTOCOL` in your shell's startup file on the remote machine if
-`showimg` guesses wrong, or can't tell. That can happen inside screen, and
-inside tmux older than 3.3, which doesn't ask the terminal its name: Warp, for
-one, sets `TERM` to plain `xterm-256color`.
+`showimg` guesses wrong, or can't tell. It overrides detection everywhere;
+[GNU screen](#gnu-screen) shows how to set it only inside screen.
 
 ```sh
-export SHOWIMG_PROTOCOL=kitty
+export SHOWIMG_PROTOCOL=iterm
 ```
 
 ---
@@ -179,6 +186,10 @@ The terminal on the machine you're sitting at must show images:
 | foot | `sixel` | Install `img2sixel` or ImageMagick where `showimg` runs |
 | Windows Terminal 1.22+ | `sixel` | As for foot. If `showimg` can't tell, set `SHOWIMG_PROTOCOL=sixel` |
 | Alacritty, Apple Terminal.app, GNOME Terminal and other VTE terminals | None | Use `showimg -p text` (needs `chafa`), or a terminal from this table for SSH sessions |
+
+Inside GNU screen, and inside tmux older than 3.3, `showimg` can't ask the
+terminal and tries `kitty`. With an `iterm` or `sixel` terminal, set
+`SHOWIMG_PROTOCOL` there (see [GNU screen](#gnu-screen)).
 
 This table comes from each terminal's documentation (and, for Warp, its source
 code). Apart from kitty, only the bytes `showimg` sends were tested, not the
@@ -279,19 +290,26 @@ testing, screen 4.8 passed images through intact, and kitty showed an image
 through screen 5.0.2.
 
 Inside screen, though, `showimg` can't ask your terminal its name, because
-screen answers such questions itself. So it stops with `can't tell which image
-protocol your terminal supports: it can't be asked from inside GNU screen`.
-Tell it the protocol for your terminal (see
-[Your terminal](#your-terminal)) in your shell's startup file on the remote
-machine, `~/.zshrc` or `~/.bashrc`:
+screen answers such questions itself. So it tries the kitty protocol, which
+kitty, Ghostty and Warp use; `showimg -v` says `so trying kitty`. For a
+terminal that uses another protocol (see [Your terminal](#your-terminal)), set
+`SHOWIMG_PROTOCOL` in your shell's startup file on the remote machine,
+`~/.zshrc` or `~/.bashrc`. Set it only inside screen, so that detection still
+works outside it:
 
 ```sh
-export SHOWIMG_PROTOCOL=kitty    # kitty, Ghostty, Warp
+if [ -n "${STY:-}" ]; then
+  export SHOWIMG_PROTOCOL=iterm    # iTerm2, WezTerm; sixel for foot, Windows Terminal
+fi
 ```
 
-You can skip this if your terminal sets `LC_TERMINAL` or `TERM_PROGRAM` and
-SSH passes it on: iTerm2 sets `LC_TERMINAL`, and many servers accept `LC_*`
-variables.
+If you reach screen from terminals that use different protocols, choose one
+for each command instead: `showimg -p iterm plot.png`.
+
+`showimg` also checks `LC_TERMINAL` and `TERM_PROGRAM` inside screen: iTerm2
+sets `LC_TERMINAL`, and many servers accept `LC_*` variables over SSH. But a
+screen window gets its environment from when the screen session started, so
+after you reattach from another terminal, they still name the old one.
 
 As with tmux, screen doesn't know the image is there, so a redraw can remove it
 or leave it behind. screen also drops these sequences from windows you aren't
@@ -410,7 +428,8 @@ terminal](#your-terminal)), then inside tmux or screen.
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| `showimg: can't tell which image protocol your terminal supports: ...` | Given after the colon: inside screen, tmux older than 3.3, or a terminal `showimg` doesn't know | `export SHOWIMG_PROTOCOL=kitty` (or `iterm`, `sixel`); see [Your terminal](#your-terminal) |
+| `showimg: can't tell which image protocol your terminal supports: ...` | Given after the colon: a terminal `showimg` doesn't know, one that didn't answer, or tmux that didn't learn its name | `export SHOWIMG_PROTOCOL=kitty` (or `iterm`, `sixel`); see [Your terminal](#your-terminal) |
+| Blank space, or garbage such as `Ga=T,f=100,...`, inside screen or tmux older than 3.3 | `showimg` couldn't ask the terminal, tried `kitty` (`-v` says `so trying kitty`), and your terminal uses another protocol | Set `SHOWIMG_PROTOCOL` inside screen; see [GNU screen](#gnu-screen) |
 | `showimg: tmux won't pass the image on: ...` | `allow-passthrough` is off | `tmux set -g allow-passthrough on`, or re-run `setup.sh` |
 | `showimg: ...: too big for tmux ...` | An iTerm2 or sixel image over tmux's limit (see [tmux](#tmux)) | Smaller `-r` for sixel, a smaller image, or a newer tmux |
 | Part of the image, or none, inside tmux older than 3.3 | tmux threw output away | Upgrade tmux to 3.3+; see [tmux before 3.3](#tmux-before-33) |
@@ -559,11 +578,13 @@ Also tested:
   from `#{client_termtype}` inside tmux 3.7, which also gave the right cell size.
   WezTerm was recognised by XTVERSION, iTerm2 by `LC_TERMINAL`, kitty by `TERM`,
   and an unnamed terminal by its answer to the kitty query or the sixel attribute
-  in its DA1 reply. Each case where `showimg` can't tell was checked to give the
-  right reason: inside screen, tmux 3.1, tmux 3.7 that didn't learn the
-  terminal's name, tmux not on `PATH`, an unknown terminal name inside and
-  outside tmux, a terminal that answers nothing (after 2 seconds), and one that
-  answers only DA1.
+  in its DA1 reply. Where the terminal can't be asked (inside screen 4.8, tmux
+  3.1, tmux not on `PATH`), `showimg` tried kitty, `-v` gave the reason, and
+  through screen and tmux 3.1 the image arrived intact; `SHOWIMG_PROTOCOL`
+  still came first. Each case where it stops was checked to give the right
+  reason: tmux 3.7 that didn't learn the terminal's name, an unknown terminal
+  name inside and outside tmux, a terminal that answers nothing (after 2
+  seconds), and one that answers only DA1.
 - **Formats.** PNG (8-bit, 16-bit and palette), baseline and progressive JPEG,
   JPEG with a 51 KB EXIF block and padding bytes, animated GIF, PDF, SVG, WebP,
   BMP and TIFF, with each protocol. Sizes read from the file headers matched
@@ -588,10 +609,11 @@ Also tested:
   repository path with a space in it.
 
 On a real terminal: kitty on Debian showed `example.png` correctly over SSH,
-inside screen 5.0.2, with `SHOWIMG_PROTOCOL=kitty`.
+inside screen 5.0.2 with `SHOWIMG_PROTOCOL=kitty` (and with `-p kitty`), and
+outside screen, where `showimg` recognised kitty by itself.
 
-Not tested: other real terminals, Warp included; kitty outside screen and in
-tmux; macOS (bash 3.2 and BSD tools); mosh; tmux control mode.
+Not tested: other real terminals, Warp included; kitty in tmux; macOS (bash 3.2
+and BSD tools); mosh; tmux control mode.
 
 ---
 

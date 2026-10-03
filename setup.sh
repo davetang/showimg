@@ -130,7 +130,7 @@ fi
 echo "GNU screen"
 if command -v screen > /dev/null; then
   ok "nothing to configure: showimg wraps the image for screen itself"
-  note "inside screen, showimg can't ask your terminal what it supports: set SHOWIMG_PROTOCOL (see README.md)"
+  note "inside screen, showimg can't ask your terminal what it supports, so it tries kitty (kitty, Ghostty, Warp); for others, set SHOWIMG_PROTOCOL (see README.md)"
 else
   ok "not installed, nothing to do"
 fi

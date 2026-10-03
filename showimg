@@ -22,7 +22,8 @@ image from standard input.
   -c COLS      at most COLS columns wide (default: the terminal's width)
   -r ROWS      at most ROWS rows tall (default: the terminal's height less 2)
   -p PROTOCOL  kitty, iterm, sixel or text (default: $SHOWIMG_PROTOCOL, or
-               the one your terminal supports)
+               the one your terminal supports; kitty if it can't be asked,
+               as inside GNU screen)
   -v           print the protocol and size used
   -h           show this help
 
@@ -589,18 +590,23 @@ if [[ -z $protocol ]]; then
   fi
 fi
 if [[ -z $protocol ]]; then
-  # say why, which says what to do
+  # say why, which says what to do. Where the terminal can't be asked at all,
+  # try kitty, the protocol of kitty, Ghostty and Warp
+  guess=false
   case $mux in
     screen)
       why="it can't be asked from inside GNU screen"
+      guess=true
       ;;
     tmux)
       if ! have tmux; then
         why="tmux isn't on PATH, so it can't be asked"
+        guess=true
       elif [[ -n $termtype ]]; then
         why="showimg doesn't know $termtype"
       elif $tmux_old; then
         why="tmux before 3.3 doesn't learn its name, and TERM=$termname doesn't say"
+        guess=true
       else
         why="tmux didn't learn its name when you attached, and TERM=$termname doesn't say"
       fi
@@ -615,10 +621,15 @@ if [[ -z $protocol ]]; then
       fi
       ;;
   esac
-  warn "can't tell which image protocol your terminal supports: $why"
-  warn "set SHOWIMG_PROTOCOL, e.g. 'export SHOWIMG_PROTOCOL=kitty' in ~/.zshrc or ~/.bashrc, or use -p"
-  warn "kitty: kitty, Ghostty, Warp; iterm: iTerm2, WezTerm; sixel: foot, Windows Terminal; text: any (needs chafa)"
-  exit 1
+  if $guess; then
+    protocol=kitty
+    say "can't tell which image protocol your terminal supports ($why), so trying kitty; if no image appears, set SHOWIMG_PROTOCOL or use -p"
+  else
+    warn "can't tell which image protocol your terminal supports: $why"
+    warn "set SHOWIMG_PROTOCOL, e.g. 'export SHOWIMG_PROTOCOL=kitty' in ~/.zshrc or ~/.bashrc, or use -p"
+    warn "kitty: kitty, Ghostty, Warp; iterm: iTerm2, WezTerm; sixel: foot, Windows Terminal; text: any (needs chafa)"
+    exit 1
+  fi
 fi
 
 if [[ $protocol == text ]] && ! have chafa; then
