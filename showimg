@@ -1,0 +1,673 @@
+#!/usr/bin/env bash
+# showimg: show an image in the terminal you are sitting at, over SSH too.
+#
+#   kitty, Ghostty, Warp        -> kitty graphics protocol
+#   iTerm2, WezTerm, VS Code    -> iTerm2 inline images
+#   foot, Windows Terminal      -> sixel (needs img2sixel or ImageMagick)
+#   any terminal, with -p text  -> coloured characters (needs chafa)
+#
+# The image is sent as an escape sequence, so it travels over the SSH
+# connection like any other output. Inside tmux or GNU screen it's wrapped so
+# that they pass it on.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: showimg [-c COLS] [-r ROWS] [-p PROTOCOL] [-v] [FILE...]
+
+Show images in your terminal. Over SSH the image is sent to your local
+terminal as an escape sequence. With no FILE, or when FILE is -, read an
+image from standard input.
+
+  -c COLS      at most COLS columns wide (default: the terminal's width)
+  -r ROWS      at most ROWS rows tall (default: the terminal's height less 2)
+  -p PROTOCOL  kitty, iterm, sixel or text (default: $SHOWIMG_PROTOCOL, or
+               the one your terminal supports)
+  -v           print the protocol and size used
+  -h           show this help
+
+PNG needs nothing extra. PDF needs pdftoppm or ImageMagick, SVG needs
+rsvg-convert or ImageMagick, and other formats need ImageMagick. sixel needs
+img2sixel or ImageMagick, and text needs chafa.
+
+Examples:
+  showimg plot.png
+  showimg -r 20 heatmap.pdf
+  curl -s https://example.com/logo.png | showimg
+EOF
+}
+
+warn() { echo "showimg: $*" >&2; }
+
+say() {
+  if $verbose; then
+    warn "$*"
+  fi
+}
+
+have() { command -v "$1" > /dev/null; }
+
+# the protocol that suits a terminal, from the names it goes by: its reply to
+# an XTVERSION query (also in tmux's client_termtype, e.g. "Warp(v0.2026...)"),
+# $LC_TERMINAL, $TERM_PROGRAM or $TERM. Prints nothing if none is known.
+# Always called in $(...), so nocasematch doesn't leak
+protocol_for() {
+  local name
+  shopt -s nocasematch
+  for name in "$@"; do
+    case $name in
+      *kitty*|*ghostty*|*warp*)          echo kitty; return ;;
+      *iterm*|*wezterm*|vscode*|mintty*) echo iterm; return ;;
+      # foot: TERM foot or foot-*, XTVERSION "foot(1.16.2)"
+      foot|foot-*|'foot('*|contour*|mlterm*) echo sixel; return ;;
+    esac
+  done
+}
+
+# ask the terminal what it is (XTVERSION), whether it speaks the kitty
+# graphics protocol, and how big its text area is in pixels. DA1 goes last:
+# every terminal answers it, so its reply marks the end of the answers
+query_terminal() {
+  local c reply='' re
+  tty_state=$(stty -g < /dev/tty 2> /dev/null) || return 0
+  stty -echo -icanon < /dev/tty
+  printf '\e_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\e\\\e[>0q\e[14t\e[c' >&3
+  # a slow SSH link can take a moment to answer; a terminal that never
+  # answers costs 2 seconds
+  while IFS= read -r -s -n 1 -d '' -t 2 c < /dev/tty; do
+    reply+=$c
+    case $reply in
+      *$'\e[?'*c) break ;;
+    esac
+  done
+  stty "$tty_state" < /dev/tty
+  tty_state=
+  if [[ -n $reply ]]; then
+    answered=true
+  fi
+
+  re=$'\eP>[|]([^\e]*)'
+  if [[ $reply =~ $re ]]; then
+    termtype=${BASH_REMATCH[1]}
+  fi
+  if [[ $reply == *$'\e_Gi=31;OK'* ]]; then
+    kitty_ok=true
+  fi
+  # attribute 4 in the DA1 reply means sixel
+  re=$'\e[[][?]([0-9;]*)c'
+  if [[ $reply =~ $re && ";${BASH_REMATCH[1]};" == *';4;'* ]]; then
+    sixel_ok=true
+  fi
+  re=$'\e[[]4;([0-9]+);([0-9]+)t'
+  if [[ $reply =~ $re ]] && (( term_rows > 0 && term_cols > 0 )); then
+    cell_h=$(( BASH_REMATCH[1] / term_rows ))
+    cell_w=$(( BASH_REMATCH[2] / term_cols ))
+  fi
+}
+
+# png, jpeg, gif, pdf, svg or other, from the file's first bytes
+kind() {
+  case $(od -An -tx1 -N8 < "$1" | tr -d ' \n') in
+    89504e470d0a1a0a) echo png ;;
+    ffd8ff*)          echo jpeg ;;
+    47494638*)        echo gif ;;
+    25504446*)        echo pdf ;;
+    *)
+      case $(head -c 1024 < "$1" | tr -d '\0') in
+        *'<svg'*) echo svg ;;
+        *)        echo other ;;
+      esac
+      ;;
+  esac
+}
+
+# bytes $3 onwards of file $1, $2 of them, as numbers in the array b
+bytes() {
+  b=()
+  read -r -a b < <(od -An -tu1 -j"$3" -N"$2" < "$1" 2> /dev/null) || true
+}
+
+# "WIDTH HEIGHT" in pixels, read from the header of file $1, of kind $2
+image_size() {
+  local b pos=2 n=0
+  case $2 in
+    png)
+      # IHDR: two big-endian 32-bit numbers, 16 bytes in
+      bytes "$1" 8 16
+      (( ${#b[@]} == 8 )) || return 1
+      echo $(( (b[0] << 24) + (b[1] << 16) + (b[2] << 8) + b[3] )) \
+        $(( (b[4] << 24) + (b[5] << 16) + (b[6] << 8) + b[7] ))
+      ;;
+    gif)
+      # two little-endian 16-bit numbers, 6 bytes in
+      bytes "$1" 4 6
+      (( ${#b[@]} == 4 )) || return 1
+      echo $(( b[0] + (b[1] << 8) )) $(( b[2] + (b[3] << 8) ))
+      ;;
+    jpeg)
+      # walk the segments (FF, type, 16-bit length) to the frame header
+      while (( n++ < 500 )); do
+        bytes "$1" 9 "$pos"
+        (( ${#b[@]} >= 4 && b[0] == 255 )) || return 1
+        if (( b[1] == 255 )); then
+          # padding before a marker
+          pos=$((pos + 1))
+          continue
+        fi
+        case ${b[1]} in
+          # SOF0 to SOF15, apart from 196, 200 and 204, which aren't frames
+          192|193|194|195|197|198|199|201|202|203|205|206|207)
+            (( ${#b[@]} == 9 )) || return 1
+            echo $(( (b[7] << 8) + b[8] )) $(( (b[5] << 8) + b[6] ))
+            return 0
+            ;;
+        esac
+        pos=$((pos + 2 + (b[2] << 8) + b[3]))
+      done
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# the ImageMagick command: magick (version 7) or convert (version 6)
+imagemagick() {
+  if have magick; then
+    echo magick
+  elif have convert; then
+    case $(convert -version 2> /dev/null) in
+      *ImageMagick*) echo convert ;;
+    esac
+  fi
+}
+
+# convert $1, of kind $2, to the PNG $3: the first page of a PDF, the first
+# frame of an animation
+to_png() {
+  local im tool=ImageMagick
+  im=$(imagemagick)
+  case $2 in
+    pdf)
+      if have pdftoppm; then
+        tool=pdftoppm
+        pdftoppm -png -r 150 -f 1 -l 1 -singlefile "$1" "${3%.png}" && return
+      elif [[ -n $im ]]; then
+        "$im" -density 150 "${1}[0]" "png:$3" && return
+      else
+        warn "$name: PDF needs pdftoppm (poppler-utils) or ImageMagick"
+        return 1
+      fi
+      ;;
+    svg)
+      if have rsvg-convert; then
+        tool=rsvg-convert
+        rsvg-convert -o "$3" "$1" && return
+      elif [[ -n $im ]]; then
+        "$im" "$1" "png:$3" && return
+      else
+        warn "$name: SVG needs rsvg-convert (librsvg) or ImageMagick"
+        return 1
+      fi
+      ;;
+    *)
+      if [[ -n $im ]]; then
+        "$im" "${1}[0]" "png:$3" && return
+      else
+        warn "$name: this format needs ImageMagick; PNG works without it"
+        return 1
+      fi
+      ;;
+  esac
+  warn "$name: $tool couldn't convert it; is it an image?"
+  return 1
+}
+
+# writes each line (a piece of escape sequence, see pieces) so that the
+# multiplexer passes it on
+wrap_awk='
+mux == "tmux" {
+  # tmux passthrough: ESC Ptmux; ... ESC \, with each ESC inside doubled
+  gsub(/\033/, "\033\033")
+  out = "\033Ptmux;" $0 "\033\\"
+}
+mux == "screen" {
+  # GNU screen passes DCS strings (ESC P ... ESC \) on untouched. An ESC \
+  # inside would end one early, so end the DCS after the ESC and start the
+  # next one with the backslash
+  out = ""
+  s = $0
+  while ((i = index(s, "\033\\")) > 0) {
+    out = out "\033P" substr(s, 1, i) "\033\\"
+    s = substr(s, i + 1)
+  }
+  if (s != "")
+    out = out "\033P" s "\033\\"
+}
+mux == "" { out = $0 }
+{
+  printf "%s", out
+  # straight on, so that a pause between pieces (see kitty_awk) is a pause
+  fflush()
+}
+'
+
+# kitty graphics protocol: base64 PNG, one chunk per line. The first chunk
+# carries the control data, and m=1 says that more chunks follow
+kitty_awk='
+NR > 1 { chunk(prev, 1) }
+{ prev = $0 }
+END { chunk(prev, 0) }
+function chunk(data, more) {
+  printf "\033_G%s,m=%d;%s\033\\\n", (n++ ? "q=2" : ctl), more, data
+  # tmux before 3.3 throws output away when it can'"'"'t keep up, and a
+  # pause after each chunk gives it time to send it on
+  if (pause) {
+    fflush()
+    system("sleep " pause)
+  }
+}
+'
+
+# The image goes to wrap_awk as lines, each a piece of escape sequence that
+# goes to the multiplexer in one go. GNU screen drops DCS strings much longer
+# than 760 bytes, so for screen, sequences are cut into pieces. Elsewhere
+# they go whole: after each passthrough, tmux writes escape sequences of its
+# own, which would land in the middle of a sequence cut into pieces
+pieces() {
+  if [[ $mux == screen ]]; then
+    fold -b -w 450
+  else
+    cat
+  fi
+}
+
+show_image() {
+  local src=$1 name=$1 kind file native w h rows px_h nl bytes size
+
+  if [[ $src == - ]]; then
+    name='standard input'
+    src=$tmp/stdin
+    cat > "$src"
+  elif [[ -d $src ]]; then
+    warn "$name: is a directory"
+    return 1
+  elif [[ ! -e $src ]]; then
+    warn "$name: no such file"
+    return 1
+  elif [[ ! -r $src ]]; then
+    warn "$name: can't read it"
+    return 1
+  fi
+  if [[ ! -s $src ]]; then
+    warn "$name: empty"
+    return 1
+  fi
+  # so that a name starting with - isn't taken for an option
+  [[ $src == -* ]] && src=./$src
+
+  # what each protocol takes as it is; anything else becomes a PNG first
+  kind=$(kind "$src")
+  case $protocol in
+    kitty) native=' png ' ;;
+    iterm) native=' png jpeg gif ' ;;
+    sixel) native=' png jpeg ' ;;
+    text)  native=' png jpeg gif ' ;;
+  esac
+  file=$src
+  if [[ $native != *" $kind "* ]]; then
+    to_png "$src" "$kind" "$tmp/image.png" || return 1
+    file=$tmp/image.png
+    kind=png
+  fi
+
+  if [[ $protocol == text ]]; then
+    say "$name: text, at most ${max_cols}x$max_rows characters"
+    chafa --format symbols --animate off --size "${max_cols}x$max_rows" "$file" >&3
+    return
+  fi
+
+  if ! read -r w h < <(image_size "$file" "$kind") || ! (( w > 0 && h > 0 )); then
+    warn "$name: can't read the image's size; is it a valid $kind?"
+    return 1
+  fi
+
+  # as many rows as fill the width, unless that's too tall. The image is
+  # placed by its height only, and the terminal works out the width from
+  # it, so it always keeps its shape
+  rows=$(( max_cols * cell_w * h / (w * cell_h) ))
+  (( rows > max_rows )) && rows=$max_rows
+  (( rows < 1 )) && rows=1
+
+  if [[ $protocol == sixel ]]; then
+    # sixel is in pixels, so make the image the height of those rows
+    px_h=$(( rows * cell_h ))
+    : > "$tmp/image.six"
+    if have img2sixel; then
+      img2sixel -h "$px_h" "$file" > "$tmp/image.six" || true
+    fi
+    # img2sixel 1.10 writes nothing for images of only a few colours, and
+    # still exits 0
+    if [[ ! -s $tmp/image.six && -n $(imagemagick) ]]; then
+      "$(imagemagick)" "${file}[0]" -resize "x$px_h" sixel:- > "$tmp/image.six" || true
+    fi
+    if [[ ! -s $tmp/image.six ]]; then
+      warn "$name: couldn't make a sixel image of it"
+      return 1
+    fi
+  fi
+
+  bytes=$(( $(wc -c < "$file") ))
+  if [[ $mux == tmux && $protocol != kitty ]]; then
+    # these go to tmux in one piece, and tmux drops anything bigger than its
+    # input buffer. Before 3.3, it also throws away output it can't send on
+    # at once, more than 8 bytes for each cell of the window. kitty's
+    # chunks are small, and paced for old tmux (see kitty_awk)
+    case $protocol in
+      iterm) size=$(( 4 * ((bytes + 2) / 3) + 100 )) ;;
+      sixel) size=$(( $(wc -c < "$tmp/image.six") + 100 )) ;;
+    esac
+    if (( size > tmux_limit )); then
+      warn "$name: too big for tmux to pass on (about $size bytes as $protocol; tmux takes $tmux_limit)"
+      if [[ $protocol == sixel ]]; then
+        warn "show it smaller with -r, or set tmux's input-buffer-size higher (tmux 3.6+)"
+      else
+        warn "use a smaller image, or set tmux's input-buffer-size higher (tmux 3.6+)"
+      fi
+      return 1
+    elif $tmux_old && (( size > tmux_old_limit )); then
+      warn "$name: too big for tmux before 3.3 to pass on in this window (about $size bytes as $protocol; it takes about $tmux_old_limit)"
+      if [[ $protocol == sixel ]]; then
+        warn "show it smaller with -r, or upgrade tmux"
+      else
+        warn "use a smaller image, or upgrade tmux"
+      fi
+      return 1
+    fi
+  fi
+
+  say "$name: $protocol${via}, $rows rows of at most ${max_cols}x$max_rows (${w}x$h pixels, cells ${cell_w}x$cell_h$cell_note)"
+
+  # make room first, then go back up: drawing the image can then never
+  # scroll the screen, and tmux and screen know where the cursor is
+  printf -v nl '%*s' "$rows" ''
+  printf '%s\e[%dA' "${nl// /$'\n'}" "$rows" >&3
+
+  # the image, between saving the cursor (ESC 7) and restoring it (ESC 8), so
+  # that the cursor ends up where tmux and screen think it is
+  drawing=$rows
+  {
+    printf '\e7\n'
+    case $protocol in
+      kitty)
+        # C=1: leave the cursor alone. q=2: no reply, which would otherwise
+        # turn up as typed input
+        base64 < "$file" | tr -d '\n' | fold -b -w "$kitty_chunk" \
+          | LC_ALL=C awk -v ctl="a=T,f=100,t=d,q=2,C=1,r=$rows" \
+              -v pause="$kitty_pause" "$kitty_awk"
+        ;;
+      iterm)
+        {
+          printf '\e]1337;File=inline=1;size=%d;height=%d;preserveAspectRatio=1:' \
+            "$bytes" "$rows"
+          base64 < "$file" | tr -d '\n'
+          printf '\a'
+        } | pieces
+        printf '\n'
+        ;;
+      sixel)
+        # line breaks inside sixel data are ignored, so they're free to go
+        tr -d '\r\n' < "$tmp/image.six" | pieces
+        printf '\n'
+        ;;
+    esac
+    printf '\e8\n'
+  } | LC_ALL=C awk -v mux="$mux" "$wrap_awk" >&3
+  drawing=
+
+  # and down past the image
+  printf '\e[%dB' "$rows" >&3
+}
+
+max_cols=
+max_rows=
+protocol=${SHOWIMG_PROTOCOL:-}
+verbose=false
+while getopts ':c:r:p:vh' opt; do
+  case $opt in
+    c) max_cols=$OPTARG ;;
+    r) max_rows=$OPTARG ;;
+    p) protocol=$OPTARG ;;
+    v) verbose=true ;;
+    h) usage; exit 0 ;;
+    :) warn "-$OPTARG needs a value"; usage >&2; exit 2 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+for n in "$max_cols" "$max_rows"; do
+  if [[ -n $n && ! $n =~ ^[1-9][0-9]{0,4}$ ]]; then
+    warn "-c and -r take a whole number from 1 to 99999, not '$n'"
+    exit 2
+  fi
+done
+case $protocol in
+  ''|kitty|iterm|sixel|text) ;;
+  *)
+    warn "unknown protocol '$protocol': use kitty, iterm, sixel or text"
+    exit 2
+    ;;
+esac
+
+if (( $# == 0 )); then
+  if [[ -t 0 ]]; then
+    warn "nothing to show: name an image file or pipe one in"
+    usage >&2
+    exit 2
+  fi
+  set -- -
+fi
+
+if ! { : > /dev/tty; } 2> /dev/null; then
+  warn "no terminal to show the image in; run showimg in an interactive session"
+  exit 1
+fi
+exec 3> /dev/tty
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/showimg.XXXXXX")
+tty_state=
+drawing=
+cleanup() {
+  if [[ -n $tty_state ]]; then
+    stty "$tty_state" < /dev/tty 2> /dev/null || true
+  fi
+  if [[ -n $drawing ]]; then
+    # interrupted while sending an image: end its escape sequence, which would
+    # otherwise swallow everything after it, the prompt included. ST (ESC \)
+    # ends any of them. The first ends the DCS that tmux or screen may be in
+    # the middle of, the second (wrapped) the image's own sequence
+    {
+      printf '\e\\'
+      printf '\e\\\n\e8\n' | LC_ALL=C awk -v mux="$mux" "$wrap_awk"
+      printf '\e[%dB' "$drawing"
+    } >&3 2> /dev/null || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ -n ${TMUX:-} ]]; then
+  mux=tmux
+elif [[ -n ${STY:-} ]]; then
+  mux=screen
+else
+  mux=
+fi
+
+term_rows=0
+term_cols=0
+read -r term_rows term_cols < <(stty size < /dev/tty 2> /dev/null) || true
+[[ $term_rows =~ ^[1-9][0-9]*$ ]] || term_rows=${LINES:-}
+[[ $term_cols =~ ^[1-9][0-9]*$ ]] || term_cols=${COLUMNS:-}
+[[ $term_rows =~ ^[1-9][0-9]*$ ]] || term_rows=24
+[[ $term_cols =~ ^[1-9][0-9]*$ ]] || term_cols=80
+
+# what the terminal is, and its cell size in pixels, from tmux or by asking it
+termtype=
+termname=
+features=
+passthrough=
+answered=false
+kitty_ok=false
+sixel_ok=false
+cell_w=0
+cell_h=0
+client_w=
+client_h=
+tmux_old=false
+tmux_limit=1048576
+tmux_old_limit=0
+case $mux in
+  tmux)
+    if have tmux; then
+      # client_cell_* are 0 when the terminal doesn't report its size in
+      # pixels, and allow-passthrough is empty before tmux 3.3
+      IFS='|' read -r termtype termname features cell_w cell_h client_w client_h passthrough < <(
+        tmux display -p ${TMUX_PANE:+-t "$TMUX_PANE"} \
+          '#{client_termtype}|#{client_termname}|#{client_termfeatures}|#{client_cell_width}|#{client_cell_height}|#{client_width}|#{client_height}|#{allow-passthrough}' \
+          2> /dev/null) || true
+      if [[ -z $passthrough ]]; then
+        tmux_old=true
+        # how much output tmux before 3.3 lets pile up before throwing it away
+        if [[ $client_w =~ ^[0-9]+$ && $client_h =~ ^[0-9]+$ ]]; then
+          tmux_old_limit=$(( 8 * (1 + client_w * client_h) ))
+        else
+          tmux_old_limit=15000
+        fi
+      fi
+      # the most tmux takes in one escape sequence; settable from tmux 3.6
+      size=$(tmux show -sv input-buffer-size 2> /dev/null) || true
+      [[ $size =~ ^[1-9][0-9]*$ ]] && tmux_limit=$size
+    else
+      say "\$TMUX is set but tmux isn't on PATH, so showimg can't ask it about your terminal"
+    fi
+    ;;
+  screen)
+    # screen answers queries itself, so the terminal can't be asked
+    ;;
+  *)
+    if [[ $protocol != text ]]; then
+      query_terminal
+    fi
+    ;;
+esac
+[[ $cell_w =~ ^[1-9][0-9]*$ ]] || cell_w=0
+[[ $cell_h =~ ^[1-9][0-9]*$ ]] || cell_h=0
+cell_note=
+if (( cell_w == 0 || cell_h == 0 )); then
+  # a typical cell. Taller than most, so a wide image fits the width
+  cell_w=10
+  cell_h=22
+  cell_note=', a guess'
+fi
+
+if [[ -z $protocol ]]; then
+  case $mux in
+    tmux)   protocol=$(protocol_for "$termtype" "$termname") ;;
+    screen) protocol=$(protocol_for "${LC_TERMINAL:-}" "${TERM_PROGRAM:-}") ;;
+    *)      protocol=$(protocol_for "$termtype" "${LC_TERMINAL:-}" "${TERM_PROGRAM:-}" "${TERM:-}") ;;
+  esac
+fi
+if [[ -z $protocol ]]; then
+  if $kitty_ok; then
+    protocol=kitty
+  elif $sixel_ok || [[ ",$features," == *,sixel,* ]]; then
+    protocol=sixel
+  fi
+fi
+if [[ -z $protocol ]]; then
+  # say why, which says what to do
+  case $mux in
+    screen)
+      why="it can't be asked from inside GNU screen"
+      ;;
+    tmux)
+      if ! have tmux; then
+        why="tmux isn't on PATH, so it can't be asked"
+      elif [[ -n $termtype ]]; then
+        why="showimg doesn't know $termtype"
+      elif $tmux_old; then
+        why="tmux before 3.3 doesn't learn its name, and TERM=$termname doesn't say"
+      else
+        why="tmux didn't learn its name when you attached, and TERM=$termname doesn't say"
+      fi
+      ;;
+    *)
+      if ! $answered; then
+        why="it didn't answer showimg's questions"
+      elif [[ -n $termtype ]]; then
+        why="showimg doesn't know $termtype, and it didn't answer the kitty graphics query or report sixel"
+      else
+        why="it didn't give its name (TERM=${TERM:-unset}), answer the kitty graphics query or report sixel, so it may not show images"
+      fi
+      ;;
+  esac
+  warn "can't tell which image protocol your terminal supports: $why"
+  warn "set SHOWIMG_PROTOCOL, e.g. 'export SHOWIMG_PROTOCOL=kitty' in ~/.zshrc or ~/.bashrc, or use -p"
+  warn "kitty: kitty, Ghostty, Warp; iterm: iTerm2, WezTerm; sixel: foot, Windows Terminal; text: any (needs chafa)"
+  exit 1
+fi
+
+if [[ $protocol == text ]] && ! have chafa; then
+  warn "-p text needs chafa"
+  exit 1
+elif [[ $protocol == sixel ]] && ! have img2sixel && [[ -z $(imagemagick) ]]; then
+  warn "sixel needs img2sixel (libsixel) or ImageMagick"
+  exit 1
+fi
+
+via=
+case $mux in
+  tmux)
+    via=' (via tmux)'
+    if [[ $protocol != text && $passthrough == off ]]; then
+      warn "tmux won't pass the image on: run 'tmux set -g allow-passthrough on' (and add it to ~/.tmux.conf)"
+      exit 1
+    fi
+    ;;
+  screen) via=' (wrapped for GNU screen)' ;;
+esac
+
+# kitty chunks are 4096 bytes at most. For screen, smaller, so that each
+# chunk fits in one DCS (see pieces)
+if [[ $mux == screen ]]; then
+  kitty_chunk=400
+else
+  kitty_chunk=4096
+fi
+# seconds between chunks (see kitty_awk)
+kitty_pause=0
+if $tmux_old; then
+  kitty_pause=0.01
+fi
+
+if [[ -z $max_cols ]] || (( max_cols > term_cols )); then
+  max_cols=$term_cols
+fi
+if [[ -z $max_rows ]]; then
+  max_rows=$(( term_rows > 3 ? term_rows - 2 : 1 ))
+elif (( max_rows > term_rows - 1 )); then
+  max_rows=$(( term_rows > 1 ? term_rows - 1 : 1 ))
+fi
+
+status=0
+for f in "$@"; do
+  if (( $# > 1 )); then
+    printf '%s\n' "$f" >&3
+  fi
+  show_image "$f" || status=1
+done
+exit "$status"
